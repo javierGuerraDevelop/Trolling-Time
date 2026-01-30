@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: League of Legends Player Tracker - Serverless Application
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        RIOT_API_KEY: "{{resolve:ssm:/trolling-time/riot-api-key:1}}"
+        PLAYERS_TABLE: !Ref PlayersTable
+        EMAIL_LOGS_TABLE: !Ref EmailLogsTable
+        ALERT_EMAILS: "{{resolve:ssm:/trolling-time/alert-emails:1}}"
+        SENDER_EMAIL: "{{resolve:ssm:/trolling-time/sender-email:1}}"
+        AWS_REGION_NAME: us-east-1
+
+Resources:
+  # DynamoDB Tables
+  PlayersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: trolling-time-players
+      AttributeDefinitions:
+        - AttributeName: player_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: player_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Application
+          Value: LOLTracker
+
+  EmailLogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: trolling-time-email-logs
+      AttributeDefinitions:
+        - AttributeName: log_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: log_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Application
+          Value: LOLTracker
+
+  # Lambda Functions
+  InitDbFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: trolling-time-init-db
+      CodeUri: functions/init_db/
+      Handler: app.lambda_handler
+      Description: Initialize DynamoDB tables with player data
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PlayersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EmailLogsTable
+
+  GetPlayerUuidFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: trolling-time-get-player-uuid
+      CodeUri: functions/get_player_uuid/
+      Handler: app.lambda_handler
+      Description: Get player PUUID from Riot API
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PlayersTable
+
+  CheckPlayersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: trolling-time-check-players
+      CodeUri: functions/check_players/
+      Handler: app.lambda_handler
+      Description: Check if tracked players are in game
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PlayersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EmailLogsTable
+        - SESCrudPolicy:
+            IdentityName: "*"
+      Events:
+        ScheduledCheck:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Description: Check players every minute
+            Enabled: true
+
+  # EventBridge Rule
+  CheckPlayersScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger CheckPlayersFunction every minute
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CheckPlayersFunction.Arn
+          Id: CheckPlayersTarget
+
+  CheckPlayersSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CheckPlayersFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CheckPlayersScheduleRule.Arn
+
+Outputs:
+  PlayersTableName:
+    Description: DynamoDB table for player data
+    Value: !Ref PlayersTable
+    Export:
+      Name: !Sub ${AWS::StackName}-PlayersTable
+
+  EmailLogsTableName:
+    Description: DynamoDB table for email logs
+    Value: !Ref EmailLogsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-EmailLogsTable
+
+  CheckPlayersFunctionArn:
+    Description: ARN of the CheckPlayers Lambda function
+    Value: !GetAtt CheckPlayersFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CheckPlayersFunction
+
+  InitDbFunctionArn:
+    Description: ARN of the InitDb Lambda function
+    Value: !GetAtt InitDbFunction.Arn
+
+  GetPlayerUuidFunctionArn:
+    Description: ARN of the GetPlayerUuid Lambda function
+    Value: !GetAtt GetPlayerUuidFunction.Arn
