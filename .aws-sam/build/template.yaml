@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Riot Notifier - Check if a League of Legends player is in game and notify
+  via email
+Parameters:
+  RiotApiKey:
+    Type: String
+    Description: Riot Games API Key
+    NoEcho: true
+  SesSenderEmail:
+    Type: String
+    Description: Verified SES sender email address
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 128
+    Runtime: provided.al2023
+    Architectures:
+    - arm64
+    Environment:
+      Variables:
+        RIOT_API_KEY:
+          Ref: RiotApiKey
+Resources:
+  GetPlayerUUIDFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: GetPlayerUUIDFunction
+      Handler: bootstrap
+    Metadata:
+      BuildMethod: makefile
+      SamResourceId: GetPlayerUUIDFunction
+  IsPlayerInGameFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: IsPlayerInGameFunction
+      Handler: bootstrap
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action: lambda:InvokeFunction
+          Resource:
+            Fn::GetAtt:
+            - SendEmailFunction
+            - Arn
+    Metadata:
+      BuildMethod: makefile
+      SamResourceId: IsPlayerInGameFunction
+  SendEmailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: SendEmailFunction
+      Handler: bootstrap
+      Environment:
+        Variables:
+          SES_SENDER_EMAIL:
+            Ref: SesSenderEmail
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action: ses:SendEmail
+          Resource: '*'
+    Metadata:
+      BuildMethod: makefile
+      SamResourceId: SendEmailFunction
