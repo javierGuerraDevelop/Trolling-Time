@@ -23,6 +23,10 @@ Parameters:
   RecipientEmail:
     Type: String
     Description: Email address to notify when player is in game
+  MatchRegion:
+    Type: String
+    Default: americas
+    Description: Riot Games match region for Match-V5 API (americas, europe, asia)
 Globals:
   Function:
     Timeout: 10
@@ -35,6 +39,39 @@ Globals:
         RIOT_API_KEY:
           Ref: RiotApiKey
 Resources:
+  GameStatsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: ${AWS::StackName}-game-stats
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: matchId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: matchId
+        KeyType: HASH
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: scheduler.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: InvokeGetGameStats
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              Fn::GetAtt:
+              - GetGameStatsFunction
+              - Arn
   IsPlayerInGameFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -52,6 +89,18 @@ Resources:
             Ref: TagLine
           RECIPIENT_EMAIL:
             Ref: RecipientEmail
+          DYNAMO_TABLE_NAME:
+            Ref: GameStatsTable
+          GET_GAME_STATS_FUNCTION_ARN:
+            Fn::GetAtt:
+            - GetGameStatsFunction
+            - Arn
+          SCHEDULER_ROLE_ARN:
+            Fn::GetAtt:
+            - SchedulerRole
+            - Arn
+          MATCH_REGION:
+            Ref: MatchRegion
       Events:
         PollSchedule:
           Type: Schedule
@@ -64,6 +113,37 @@ Resources:
         - Effect: Allow
           Action: ses:SendEmail
           Resource: '*'
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: GameStatsTable
+      - Statement:
+        - Effect: Allow
+          Action: scheduler:CreateSchedule
+          Resource: '*'
+        - Effect: Allow
+          Action: iam:PassRole
+          Resource:
+            Fn::GetAtt:
+            - SchedulerRole
+            - Arn
     Metadata:
       BuildMethod: makefile
       SamResourceId: IsPlayerInGameFunction
+  GetGameStatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: GetGameStatsFunction
+      Handler: bootstrap
+      Environment:
+        Variables:
+          MATCH_REGION:
+            Ref: MatchRegion
+          DYNAMO_TABLE_NAME:
+            Ref: GameStatsTable
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: GameStatsTable
+    Metadata:
+      BuildMethod: makefile
+      SamResourceId: GetGameStatsFunction

@@ -8,9 +8,15 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	dbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/scheduler"
+	schedulertypes "github.com/aws/aws-sdk-go-v2/service/scheduler/types"
 	"github.com/aws/aws-sdk-go-v2/service/ses"
 	"github.com/aws/aws-sdk-go-v2/service/ses/types"
 )
@@ -32,6 +38,8 @@ type RiotAccountResponse struct {
 }
 
 type SpectatorResponse struct {
+	GameID        int64         `json:"gameId"`
+	PlatformID    string        `json:"platformId"`
 	GameMode      string        `json:"gameMode"`
 	GameStartTime int64         `json:"gameStartTime"`
 	Participants  []Participant `json:"participants"`
@@ -80,6 +88,29 @@ func handler(ctx context.Context, req Request) (Response, error) {
 		return Response{InGame: false}, nil
 	}
 
+	matchID := fmt.Sprintf("%s_%d", spectator.PlatformID, spectator.GameID)
+
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return Response{}, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	tableName := os.Getenv("DYNAMO_TABLE_NAME")
+	dbClient := dynamodb.NewFromConfig(cfg)
+
+	tracked, err := gameAlreadyTracked(ctx, dbClient, tableName, matchID)
+	if err != nil {
+		return Response{}, fmt.Errorf("failed to check DynamoDB: %w", err)
+	}
+	if tracked {
+		log.Printf("Game %s already tracked, skipping", matchID)
+		return Response{InGame: true, GameMode: spectator.GameMode}, nil
+	}
+
+	if err := writeGameRecord(ctx, dbClient, tableName, matchID); err != nil {
+		return Response{}, fmt.Errorf("failed to write game record: %w", err)
+	}
+
 	var championID int64
 	for _, p := range spectator.Participants {
 		if p.PUUID == puuid {
@@ -94,11 +125,77 @@ func handler(ctx context.Context, req Request) (Response, error) {
 		}
 	}
 
+	schedulerClient := scheduler.NewFromConfig(cfg)
+	if err := createOneTimeSchedule(ctx, schedulerClient, matchID, puuid); err != nil {
+		log.Printf("WARNING: failed to create stats schedule: %v", err)
+	}
+
 	return Response{
 		InGame:     true,
 		GameMode:   spectator.GameMode,
 		ChampionID: championID,
 	}, nil
+}
+
+func gameAlreadyTracked(ctx context.Context, client *dynamodb.Client, tableName, matchID string) (bool, error) {
+	result, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &tableName,
+		Key: map[string]dbtypes.AttributeValue{
+			"matchId": &dbtypes.AttributeValueMemberS{Value: matchID},
+		},
+		ProjectionExpression: aws.String("matchId"),
+	})
+	if err != nil {
+		return false, err
+	}
+	return result.Item != nil, nil
+}
+
+func writeGameRecord(ctx context.Context, client *dynamodb.Client, tableName, matchID string) error {
+	_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &tableName,
+		Item: map[string]dbtypes.AttributeValue{
+			"matchId": &dbtypes.AttributeValueMemberS{Value: matchID},
+		},
+	})
+	return err
+}
+
+func createOneTimeSchedule(ctx context.Context, client *scheduler.Client, matchID, puuid string) error {
+	functionArn := os.Getenv("GET_GAME_STATS_FUNCTION_ARN")
+	roleArn := os.Getenv("SCHEDULER_ROLE_ARN")
+	matchRegion := os.Getenv("MATCH_REGION")
+
+	if functionArn == "" || roleArn == "" || matchRegion == "" {
+		return fmt.Errorf("GET_GAME_STATS_FUNCTION_ARN, SCHEDULER_ROLE_ARN, and MATCH_REGION must be set")
+	}
+
+	scheduleName := fmt.Sprintf("game-stats-%s", matchID)
+	scheduleTime := time.Now().Add(1 * time.Hour).UTC().Format("2006-01-02T15:04:05")
+	scheduleExpr := fmt.Sprintf("at(%s)", scheduleTime)
+
+	payload := fmt.Sprintf(`{"matchId":"%s","puuid":"%s"}`, matchID, puuid)
+
+	deleteAction := schedulertypes.ActionAfterCompletionDelete
+
+	_, err := client.CreateSchedule(ctx, &scheduler.CreateScheduleInput{
+		Name:                         &scheduleName,
+		ScheduleExpression:           &scheduleExpr,
+		ScheduleExpressionTimezone:   aws.String("UTC"),
+		ActionAfterCompletion:        deleteAction,
+		FlexibleTimeWindow:           &schedulertypes.FlexibleTimeWindow{Mode: schedulertypes.FlexibleTimeWindowModeOff},
+		Target: &schedulertypes.Target{
+			Arn:     &functionArn,
+			RoleArn: &roleArn,
+			Input:   &payload,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create schedule %s: %w", scheduleName, err)
+	}
+
+	log.Printf("Created one-time schedule %s for %s", scheduleName, scheduleTime)
+	return nil
 }
 
 func getPUUID(ctx context.Context, apiKey, name, tag string) (string, error) {
