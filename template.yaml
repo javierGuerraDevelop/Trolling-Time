@@ -10,6 +10,19 @@ Parameters:
   SesSenderEmail:
     Type: String
     Description: Verified SES sender email address
+  RiotRegion:
+    Type: String
+    Default: na1
+    Description: Riot Games API region (e.g. na1, euw1, kr)
+  PlayerName:
+    Type: String
+    Description: Riot Games player name to monitor
+  TagLine:
+    Type: String
+    Description: Riot Games tag line to monitor (without the #)
+  RecipientEmail:
+    Type: String
+    Description: Email address to notify when player is in game
 
 Globals:
   Function:
@@ -23,35 +36,25 @@ Globals:
         RIOT_API_KEY: !Ref RiotApiKey
 
 Resources:
-  GetPlayerUUIDFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: functions/get-player-uuid/
-      Handler: bootstrap
-    Metadata:
-      BuildMethod: makefile
-
   IsPlayerInGameFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: functions/is-player-in-game/
       Handler: bootstrap
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !GetAtt SendEmailFunction.Arn
-    Metadata:
-      BuildMethod: makefile
-
-  SendEmailFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: functions/send-email/
-      Handler: bootstrap
       Environment:
         Variables:
+          RIOT_REGION: !Ref RiotRegion
           SES_SENDER_EMAIL: !Ref SesSenderEmail
+          PLAYER_NAME: !Ref PlayerName
+          TAG_LINE: !Ref TagLine
+          RECIPIENT_EMAIL: !Ref RecipientEmail
+      Events:
+        PollSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Check if player is in a League game every 5 minutes
+            Enabled: true
       Policies:
         - Statement:
             - Effect: Allow
