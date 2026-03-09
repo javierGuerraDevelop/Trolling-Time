@@ -1,3 +1,6 @@
+// GetGameStatsFunction is invoked by EventBridge Scheduler ~1 hour after a game
+// is detected. It fetches completed match data from the Riot Match-V5 API and
+// updates the existing DynamoDB record with the player's stats.
 package main
 
 import (
@@ -29,6 +32,7 @@ type MatchInfo struct {
 	Participants []MatchParticipant `json:"participants"`
 }
 
+// MatchParticipant holds the per-player fields we care about from the Match-V5 response.
 type MatchParticipant struct {
 	PUUID                      string `json:"puuid"`
 	ChampionName               string `json:"championName"`
@@ -52,6 +56,7 @@ type MatchParticipant struct {
 	Item6                      int    `json:"item6"`
 }
 
+// GameStatsRecord is the DynamoDB item schema. Marshaled via dynamodbav tags.
 type GameStatsRecord struct {
 	MatchID                     string `dynamodbav:"matchId"`
 	ChampionName                string `dynamodbav:"championName"`
@@ -76,6 +81,7 @@ type GameStatsRecord struct {
 	Item6                       int    `dynamodbav:"item6"`
 }
 
+// handler fetches match details from Riot, finds the tracked player, and writes stats to DynamoDB.
 func handler(ctx context.Context, event GameStatsEvent) error {
 	apiKey := os.Getenv("RIOT_API_KEY")
 	matchRegion := os.Getenv("MATCH_REGION")
@@ -138,6 +144,7 @@ func handler(ctx context.Context, event GameStatsEvent) error {
 	return nil
 }
 
+// getMatchDetails calls the Riot Match-V5 API to get completed match data.
 func getMatchDetails(ctx context.Context, apiKey, matchRegion, matchID string) (*MatchResponse, error) {
 	url := fmt.Sprintf("https://%s.api.riotgames.com/lol/match/v5/matches/%s", matchRegion, matchID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -164,6 +171,7 @@ func getMatchDetails(ctx context.Context, apiKey, matchRegion, matchID string) (
 	return &match, nil
 }
 
+// writeStats overwrites the existing DynamoDB record (which only had matchId) with full stats.
 func writeStats(ctx context.Context, tableName string, record GameStatsRecord) error {
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {

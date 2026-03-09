@@ -1,3 +1,9 @@
+/*
+IsPlayerInGameFunction polls the Riot Spectator API every 5 minutes to check
+if a player is in an active game. On first detection it writes the match to
+DynamoDB (for deduplication), publishes a notification to SNS, and
+schedules a one-time EventBridge event to collect post-game stats.
+*/
 package main
 
 import (
@@ -17,14 +23,19 @@ import (
 	dbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/scheduler"
 	schedulertypes "github.com/aws/aws-sdk-go-v2/service/scheduler/types"
-	"github.com/aws/aws-sdk-go-v2/service/ses"
-	"github.com/aws/aws-sdk-go-v2/service/ses/types"
+	"github.com/aws/aws-sdk-go-v2/service/sns"
 )
 
 type Request struct {
-	PlayerName     string `json:"playerName"`
-	TagLine        string `json:"tagLine"`
-	RecipientEmail string `json:"recipientEmail"`
+	PlayerName string `json:"playerName"`
+	TagLine    string `json:"tagLine"`
+}
+
+type NotificationMessage struct {
+	PlayerName    string `json:"playerName"`
+	GameMode      string `json:"gameMode"`
+	ChampionID    int64  `json:"championId"`
+	GameStartTime int64  `json:"gameStartTime"`
 }
 
 type Response struct {
@@ -50,6 +61,10 @@ type Participant struct {
 	ChampionID int64  `json:"championId"`
 }
 
+/*
+handler resolves the player's PUUID, checks for an active game, deduplicates
+via DynamoDB, sends a notification, and schedules post-game stats collection.
+*/
 func handler(ctx context.Context, req Request) (Response, error) {
 	apiKey := os.Getenv("RIOT_API_KEY")
 	region := os.Getenv("RIOT_REGION")
@@ -67,12 +82,9 @@ func handler(ctx context.Context, req Request) (Response, error) {
 	if req.TagLine == "" {
 		req.TagLine = os.Getenv("TAG_LINE")
 	}
-	if req.RecipientEmail == "" {
-		req.RecipientEmail = os.Getenv("RECIPIENT_EMAIL")
-	}
 
-	if req.PlayerName == "" || req.TagLine == "" || req.RecipientEmail == "" {
-		return Response{}, fmt.Errorf("playerName, tagLine, and email are required")
+	if req.PlayerName == "" || req.TagLine == "" {
+		return Response{}, fmt.Errorf("playerName and tagLine are required")
 	}
 
 	puuid, err := getPUUID(ctx, apiKey, req.PlayerName, req.TagLine)
@@ -119,10 +131,8 @@ func handler(ctx context.Context, req Request) (Response, error) {
 		}
 	}
 
-	if req.RecipientEmail != "" {
-		if err := sendEmail(ctx, req.RecipientEmail, req.PlayerName, spectator.GameMode, championID, spectator.GameStartTime); err != nil {
-			return Response{}, fmt.Errorf("failed to send email: %w", err)
-		}
+	if err := publishNotification(ctx, cfg, req.PlayerName, spectator.GameMode, championID, spectator.GameStartTime); err != nil {
+		return Response{}, fmt.Errorf("failed to publish notification: %w", err)
 	}
 
 	schedulerClient := scheduler.NewFromConfig(cfg)
@@ -137,6 +147,7 @@ func handler(ctx context.Context, req Request) (Response, error) {
 	}, nil
 }
 
+// gameAlreadyTracked checks if a matchId already exists in DynamoDB to prevent duplicate notifications.
 func gameAlreadyTracked(ctx context.Context, client *dynamodb.Client, tableName, matchID string) (bool, error) {
 	result, err := client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: &tableName,
@@ -151,6 +162,8 @@ func gameAlreadyTracked(ctx context.Context, client *dynamodb.Client, tableName,
 	return result.Item != nil, nil
 }
 
+// writeGameRecord creates a minimal DynamoDB record with just the matchId key.
+// Stats fields are populated later by GetGameStatsFunction.
 func writeGameRecord(ctx context.Context, client *dynamodb.Client, tableName, matchID string) error {
 	_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: &tableName,
@@ -161,6 +174,10 @@ func writeGameRecord(ctx context.Context, client *dynamodb.Client, tableName, ma
 	return err
 }
 
+/*
+createOneTimeSchedule creates an EventBridge Scheduler one-time schedule that
+invokes GetGameStatsFunction in 1 hour. The schedule auto-deletes after execution.
+*/
 func createOneTimeSchedule(ctx context.Context, client *scheduler.Client, matchID, puuid string) error {
 	functionArn := os.Getenv("GET_GAME_STATS_FUNCTION_ARN")
 	roleArn := os.Getenv("SCHEDULER_ROLE_ARN")
@@ -179,11 +196,11 @@ func createOneTimeSchedule(ctx context.Context, client *scheduler.Client, matchI
 	deleteAction := schedulertypes.ActionAfterCompletionDelete
 
 	_, err := client.CreateSchedule(ctx, &scheduler.CreateScheduleInput{
-		Name:                         &scheduleName,
-		ScheduleExpression:           &scheduleExpr,
-		ScheduleExpressionTimezone:   aws.String("UTC"),
-		ActionAfterCompletion:        deleteAction,
-		FlexibleTimeWindow:           &schedulertypes.FlexibleTimeWindow{Mode: schedulertypes.FlexibleTimeWindowModeOff},
+		Name:                       &scheduleName,
+		ScheduleExpression:         &scheduleExpr,
+		ScheduleExpressionTimezone: aws.String("UTC"),
+		ActionAfterCompletion:      deleteAction,
+		FlexibleTimeWindow:         &schedulertypes.FlexibleTimeWindow{Mode: schedulertypes.FlexibleTimeWindowModeOff},
 		Target: &schedulertypes.Target{
 			Arn:     &functionArn,
 			RoleArn: &roleArn,
@@ -198,6 +215,7 @@ func createOneTimeSchedule(ctx context.Context, client *scheduler.Client, matchI
 	return nil
 }
 
+// getPUUID resolves a Riot ID (name#tag) to a PUUID via the Riot Account API.
 func getPUUID(ctx context.Context, apiKey, name, tag string) (string, error) {
 	url := fmt.Sprintf("https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/%s/%s", name, tag)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -226,6 +244,7 @@ func getPUUID(ctx context.Context, apiKey, name, tag string) (string, error) {
 	return account.PUUID, nil
 }
 
+// getActiveGame calls the Spectator V5 API. Returns nil if the player is not in a game.
 func getActiveGame(apiKey, region, puuid string) (*SpectatorResponse, error) {
 	url := fmt.Sprintf("https://%s.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/%s", region, puuid)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -255,33 +274,30 @@ func getActiveGame(apiKey, region, puuid string) (*SpectatorResponse, error) {
 	return &spectator, nil
 }
 
-func sendEmail(ctx context.Context, recipient, playerName, gameMode string, championID, gameStartTime int64) error {
-	senderEmail := os.Getenv("SES_SENDER_EMAIL")
-	if senderEmail == "" {
-		return fmt.Errorf("SES_SENDER_EMAIL not set")
+// publishNotification publishes a game detection message to SNS for fan-out to notification channels.
+func publishNotification(ctx context.Context, cfg aws.Config, playerName, gameMode string, championID, gameStartTime int64) error {
+	topicArn := os.Getenv("SNS_TOPIC_ARN")
+	if topicArn == "" {
+		return fmt.Errorf("SNS_TOPIC_ARN not set")
 	}
 
-	subject := fmt.Sprintf("%s is in a game!", playerName)
-	body := fmt.Sprintf("%s is currently in a %s game (Champion ID: %d, Start Time: %d)",
-		playerName, gameMode, championID, gameStartTime)
+	msg := NotificationMessage{
+		PlayerName:    playerName,
+		GameMode:      gameMode,
+		ChampionID:    championID,
+		GameStartTime: gameStartTime,
+	}
 
-	cfg, err := config.LoadDefaultConfig(ctx)
+	payload, err := json.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("failed to load AWS config: %w", err)
+		return fmt.Errorf("failed to marshal notification: %w", err)
 	}
 
-	client := ses.NewFromConfig(cfg)
-	_, err = client.SendEmail(ctx, &ses.SendEmailInput{
-		Source: &senderEmail,
-		Destination: &types.Destination{
-			ToAddresses: []string{recipient},
-		},
-		Message: &types.Message{
-			Subject: &types.Content{Data: &subject},
-			Body: &types.Body{
-				Text: &types.Content{Data: &body},
-			},
-		},
+	client := sns.NewFromConfig(cfg)
+	message := string(payload)
+	_, err = client.Publish(ctx, &sns.PublishInput{
+		TopicArn: &topicArn,
+		Message:  &message,
 	})
 	return err
 }

@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Riot Notifier - Check if a League of Legends player is in game and notify
-  via email
+  via webhooks
 Parameters:
   RiotApiKey:
     Type: String
@@ -27,6 +27,11 @@ Parameters:
     Type: String
     Default: americas
     Description: Riot Games match region for Match-V5 API (americas, europe, asia)
+  DiscordWebhookUrl:
+    Type: String
+    Default: ''
+    Description: Discord webhook URL for game notifications (optional)
+    NoEcho: true
 Globals:
   Function:
     Timeout: 10
@@ -39,6 +44,11 @@ Globals:
         RIOT_API_KEY:
           Ref: RiotApiKey
 Resources:
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName:
+        Fn::Sub: ${AWS::StackName}-notifications
   GameStatsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -81,14 +91,10 @@ Resources:
         Variables:
           RIOT_REGION:
             Ref: RiotRegion
-          SES_SENDER_EMAIL:
-            Ref: SesSenderEmail
           PLAYER_NAME:
             Ref: PlayerName
           TAG_LINE:
             Ref: TagLine
-          RECIPIENT_EMAIL:
-            Ref: RecipientEmail
           DYNAMO_TABLE_NAME:
             Ref: GameStatsTable
           GET_GAME_STATS_FUNCTION_ARN:
@@ -101,6 +107,8 @@ Resources:
             - Arn
           MATCH_REGION:
             Ref: MatchRegion
+          SNS_TOPIC_ARN:
+            Ref: NotificationTopic
       Events:
         PollSchedule:
           Type: Schedule
@@ -111,8 +119,9 @@ Resources:
       Policies:
       - Statement:
         - Effect: Allow
-          Action: ses:SendEmail
-          Resource: '*'
+          Action: sns:Publish
+          Resource:
+            Ref: NotificationTopic
       - DynamoDBCrudPolicy:
           TableName:
             Ref: GameStatsTable
@@ -129,6 +138,33 @@ Resources:
     Metadata:
       BuildMethod: makefile
       SamResourceId: IsPlayerInGameFunction
+  NotifyWebhooksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: NotifyWebhooksFunction
+      Handler: bootstrap
+      Environment:
+        Variables:
+          DISCORD_WEBHOOK_URL:
+            Ref: DiscordWebhookUrl
+          SES_SENDER_EMAIL:
+            Ref: SesSenderEmail
+          RECIPIENT_EMAIL:
+            Ref: RecipientEmail
+      Events:
+        SNSEvent:
+          Type: SNS
+          Properties:
+            Topic:
+              Ref: NotificationTopic
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action: ses:SendEmail
+          Resource: '*'
+    Metadata:
+      BuildMethod: makefile
+      SamResourceId: NotifyWebhooksFunction
   GetGameStatsFunction:
     Type: AWS::Serverless::Function
     Properties:
