@@ -11,11 +11,36 @@ import (
 	"log"
 	"net/http"
 	"os"
+
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 )
+
+// DynamoDBAPI is the interface for DynamoDB operations used by this function.
+type DynamoDBAPI interface {
+	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+}
+
+// HTTPClient is the interface for making HTTP requests.
+type HTTPClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+// AppConfig holds configuration values loaded from environment variables.
+type AppConfig struct {
+	RiotAPIKey  string
+	MatchRegion string
+	TableName   string
+}
+
+// App holds the dependencies for the Lambda function.
+type App struct {
+	db   DynamoDBAPI
+	http HTTPClient
+	cfg  AppConfig
+}
 
 type GameStatsEvent struct {
 	MatchID string `json:"matchId"`
@@ -34,31 +59,32 @@ type MatchInfo struct {
 
 // MatchParticipant holds the per-player fields we care about from the Match-V5 response.
 type MatchParticipant struct {
-	PUUID                      string `json:"puuid"`
-	ChampionName               string `json:"championName"`
-	Win                        bool   `json:"win"`
-	Kills                      int    `json:"kills"`
-	Deaths                     int    `json:"deaths"`
-	Assists                    int    `json:"assists"`
-	TotalMinionsKilled         int    `json:"totalMinionsKilled"`
-	NeutralMinionsKilled       int    `json:"neutralMinionsKilled"`
-	GoldEarned                 int    `json:"goldEarned"`
-	TotalDamageDealtToChampions int   `json:"totalDamageDealtToChampions"`
-	VisionScore                int    `json:"visionScore"`
-	ChampLevel                 int    `json:"champLevel"`
-	TeamPosition               string `json:"teamPosition"`
-	Item0                      int    `json:"item0"`
-	Item1                      int    `json:"item1"`
-	Item2                      int    `json:"item2"`
-	Item3                      int    `json:"item3"`
-	Item4                      int    `json:"item4"`
-	Item5                      int    `json:"item5"`
-	Item6                      int    `json:"item6"`
+	PUUID                       string `json:"puuid"`
+	ChampionName                string `json:"championName"`
+	Win                         bool   `json:"win"`
+	Kills                       int    `json:"kills"`
+	Deaths                      int    `json:"deaths"`
+	Assists                     int    `json:"assists"`
+	TotalMinionsKilled          int    `json:"totalMinionsKilled"`
+	NeutralMinionsKilled        int    `json:"neutralMinionsKilled"`
+	GoldEarned                  int    `json:"goldEarned"`
+	TotalDamageDealtToChampions int    `json:"totalDamageDealtToChampions"`
+	VisionScore                 int    `json:"visionScore"`
+	ChampLevel                  int    `json:"champLevel"`
+	TeamPosition                string `json:"teamPosition"`
+	Item0                       int    `json:"item0"`
+	Item1                       int    `json:"item1"`
+	Item2                       int    `json:"item2"`
+	Item3                       int    `json:"item3"`
+	Item4                       int    `json:"item4"`
+	Item5                       int    `json:"item5"`
+	Item6                       int    `json:"item6"`
 }
 
 // GameStatsRecord is the DynamoDB item schema. Marshaled via dynamodbav tags.
 type GameStatsRecord struct {
 	MatchID                     string `dynamodbav:"matchId"`
+	PUUID                       string `dynamodbav:"puuid"`
 	ChampionName                string `dynamodbav:"championName"`
 	GameMode                    string `dynamodbav:"gameMode"`
 	Win                         bool   `dynamodbav:"win"`
@@ -81,29 +107,34 @@ type GameStatsRecord struct {
 	Item6                       int    `dynamodbav:"item6"`
 }
 
-// handler fetches match details from Riot, finds the tracked player, and writes stats to DynamoDB.
-func handler(ctx context.Context, event GameStatsEvent) error {
-	apiKey := os.Getenv("RIOT_API_KEY")
-	matchRegion := os.Getenv("MATCH_REGION")
-	tableName := os.Getenv("DYNAMO_TABLE_NAME")
-
-	if apiKey == "" || matchRegion == "" || tableName == "" {
-		return fmt.Errorf("RIOT_API_KEY, MATCH_REGION, and DYNAMO_TABLE_NAME must be set")
+func loadConfig() (AppConfig, error) {
+	cfg := AppConfig{
+		RiotAPIKey:  os.Getenv("RIOT_API_KEY"),
+		MatchRegion: os.Getenv("MATCH_REGION"),
+		TableName:   os.Getenv("DYNAMO_TABLE_NAME"),
 	}
+	if cfg.RiotAPIKey == "" || cfg.MatchRegion == "" || cfg.TableName == "" {
+		return cfg, fmt.Errorf("RIOT_API_KEY, MATCH_REGION, and DYNAMO_TABLE_NAME must be set")
+	}
+	return cfg, nil
+}
+
+// handler fetches match details from Riot, finds the tracked player, and writes stats to DynamoDB.
+func (app *App) handler(ctx context.Context, event GameStatsEvent) error {
 	if event.MatchID == "" || event.PUUID == "" {
 		return fmt.Errorf("matchId and puuid are required")
 	}
 
 	log.Printf("Fetching match stats for %s (player %s)", event.MatchID, event.PUUID)
 
-	match, err := getMatchDetails(ctx, apiKey, matchRegion, event.MatchID)
+	match, err := app.getMatchDetails(ctx, event.MatchID)
 	if err != nil {
 		return fmt.Errorf("failed to get match details: %w", err)
 	}
 
 	var player *MatchParticipant
-	for i, p := range match.Info.Participants {
-		if p.PUUID == event.PUUID {
+	for i, participant := range match.Info.Participants {
+		if participant.PUUID == event.PUUID {
 			player = &match.Info.Participants[i]
 			break
 		}
@@ -114,6 +145,7 @@ func handler(ctx context.Context, event GameStatsEvent) error {
 
 	record := GameStatsRecord{
 		MatchID:                     event.MatchID,
+		PUUID:                       event.PUUID,
 		ChampionName:                player.ChampionName,
 		GameMode:                    match.Info.GameMode,
 		Win:                         player.Win,
@@ -136,7 +168,7 @@ func handler(ctx context.Context, event GameStatsEvent) error {
 		Item6:                       player.Item6,
 	}
 
-	if err := writeStats(ctx, tableName, record); err != nil {
+	if err := app.writeStats(ctx, record); err != nil {
 		return fmt.Errorf("failed to write stats to DynamoDB: %w", err)
 	}
 
@@ -145,15 +177,15 @@ func handler(ctx context.Context, event GameStatsEvent) error {
 }
 
 // getMatchDetails calls the Riot Match-V5 API to get completed match data.
-func getMatchDetails(ctx context.Context, apiKey, matchRegion, matchID string) (*MatchResponse, error) {
-	url := fmt.Sprintf("https://%s.api.riotgames.com/lol/match/v5/matches/%s", matchRegion, matchID)
+func (app *App) getMatchDetails(ctx context.Context, matchID string) (*MatchResponse, error) {
+	url := fmt.Sprintf("https://%s.api.riotgames.com/lol/match/v5/matches/%s", app.cfg.MatchRegion, matchID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-Riot-Token", apiKey)
+	req.Header.Set("X-Riot-Token", app.cfg.RiotAPIKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := app.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -171,26 +203,36 @@ func getMatchDetails(ctx context.Context, apiKey, matchRegion, matchID string) (
 	return &match, nil
 }
 
-// writeStats overwrites the existing DynamoDB record (which only had matchId) with full stats.
-func writeStats(ctx context.Context, tableName string, record GameStatsRecord) error {
-	cfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to load AWS config: %w", err)
-	}
-
+// writeStats overwrites the existing DynamoDB record with full stats.
+func (app *App) writeStats(ctx context.Context, record GameStatsRecord) error {
 	item, err := attributevalue.MarshalMap(record)
 	if err != nil {
 		return fmt.Errorf("failed to marshal record: %w", err)
 	}
 
-	client := dynamodb.NewFromConfig(cfg)
-	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: &tableName,
+	_, err = app.db.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &app.cfg.TableName,
 		Item:      item,
 	})
 	return err
 }
 
 func main() {
-	lambda.Start(handler)
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	awsCfg, err := config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to load AWS config: %v", err)
+	}
+
+	app := &App{
+		db:   dynamodb.NewFromConfig(awsCfg),
+		http: http.DefaultClient,
+		cfg:  cfg,
+	}
+
+	lambda.Start(app.handler)
 }

@@ -24,6 +24,9 @@ profile.cov
 go.work
 go.work.sum
 
+# SAM build artifacts
+.aws-sam/
+
 # env file
 .env
 

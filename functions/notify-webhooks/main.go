@@ -23,6 +23,30 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ses/types"
 )
 
+// SESAPI is the interface for SES operations used by this function.
+type SESAPI interface {
+	SendEmail(ctx context.Context, params *ses.SendEmailInput, optFns ...func(*ses.Options)) (*ses.SendEmailOutput, error)
+}
+
+// HTTPClient is the interface for making HTTP requests.
+type HTTPClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+// AppConfig holds configuration values loaded from environment variables.
+type AppConfig struct {
+	DiscordWebhookURL string
+	SESSenderEmail    string
+	RecipientEmail    string
+}
+
+// App holds the dependencies for the Lambda function.
+type App struct {
+	ses  SESAPI
+	http HTTPClient
+	cfg  AppConfig
+}
+
 type NotificationMessage struct {
 	PlayerName    string `json:"playerName"`
 	GameMode      string `json:"gameMode"`
@@ -30,7 +54,15 @@ type NotificationMessage struct {
 	GameStartTime int64  `json:"gameStartTime"`
 }
 
-func handler(ctx context.Context, snsEvent events.SNSEvent) error {
+func loadConfig() AppConfig {
+	return AppConfig{
+		DiscordWebhookURL: os.Getenv("DISCORD_WEBHOOK_URL"),
+		SESSenderEmail:    os.Getenv("SES_SENDER_EMAIL"),
+		RecipientEmail:    os.Getenv("RECIPIENT_EMAIL"),
+	}
+}
+
+func (app *App) handler(ctx context.Context, snsEvent events.SNSEvent) error {
 	for _, record := range snsEvent.Records {
 		var msg NotificationMessage
 		if err := json.Unmarshal([]byte(record.SNS.Message), &msg); err != nil {
@@ -38,16 +70,14 @@ func handler(ctx context.Context, snsEvent events.SNSEvent) error {
 			continue
 		}
 
-		if url := os.Getenv("DISCORD_WEBHOOK_URL"); url != "" {
-			if err := sendDiscord(url, msg); err != nil {
+		if app.cfg.DiscordWebhookURL != "" {
+			if err := app.sendDiscord(msg); err != nil {
 				log.Printf("ERROR: Discord notification failed: %v", err)
 			}
 		}
 
-		senderEmail := os.Getenv("SES_SENDER_EMAIL")
-		recipientEmail := os.Getenv("RECIPIENT_EMAIL")
-		if senderEmail != "" && recipientEmail != "" {
-			if err := sendEmail(ctx, senderEmail, recipientEmail, msg); err != nil {
+		if app.cfg.SESSenderEmail != "" && app.cfg.RecipientEmail != "" {
+			if err := app.sendEmail(ctx, msg); err != nil {
 				log.Printf("ERROR: Email notification failed: %v", err)
 			}
 		}
@@ -57,7 +87,7 @@ func handler(ctx context.Context, snsEvent events.SNSEvent) error {
 }
 
 // sendDiscord posts an embed message to a Discord webhook.
-func sendDiscord(webhookURL string, msg NotificationMessage) error {
+func (app *App) sendDiscord(msg NotificationMessage) error {
 	timestamp := time.UnixMilli(msg.GameStartTime).UTC().Format(time.RFC3339)
 
 	payload := map[string]interface{}{
@@ -78,7 +108,13 @@ func sendDiscord(webhookURL string, msg NotificationMessage) error {
 		return fmt.Errorf("failed to marshal Discord payload: %w", err)
 	}
 
-	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, app.cfg.DiscordWebhookURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create Discord request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to POST to Discord: %w", err)
 	}
@@ -93,21 +129,15 @@ func sendDiscord(webhookURL string, msg NotificationMessage) error {
 }
 
 // sendEmail sends a game detection notification via SES.
-func sendEmail(ctx context.Context, sender, recipient string, msg NotificationMessage) error {
-	cfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to load AWS config: %w", err)
-	}
-
+func (app *App) sendEmail(ctx context.Context, msg NotificationMessage) error {
 	subject := fmt.Sprintf("%s is in a game!", msg.PlayerName)
 	body := fmt.Sprintf("%s is currently in a %s game (Champion ID: %d, Start Time: %d)",
 		msg.PlayerName, msg.GameMode, msg.ChampionID, msg.GameStartTime)
 
-	client := ses.NewFromConfig(cfg)
-	_, err = client.SendEmail(ctx, &ses.SendEmailInput{
-		Source: &sender,
+	_, err := app.ses.SendEmail(ctx, &ses.SendEmailInput{
+		Source: &app.cfg.SESSenderEmail,
 		Destination: &types.Destination{
-			ToAddresses: []string{recipient},
+			ToAddresses: []string{app.cfg.RecipientEmail},
 		},
 		Message: &types.Message{
 			Subject: &types.Content{Data: &subject},
@@ -120,5 +150,18 @@ func sendEmail(ctx context.Context, sender, recipient string, msg NotificationMe
 }
 
 func main() {
-	lambda.Start(handler)
+	cfg := loadConfig()
+
+	awsCfg, err := config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to load AWS config: %v", err)
+	}
+
+	app := &App{
+		ses:  ses.NewFromConfig(awsCfg),
+		http: http.DefaultClient,
+		cfg:  cfg,
+	}
+
+	lambda.Start(app.handler)
 }

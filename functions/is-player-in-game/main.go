@@ -1,6 +1,6 @@
 /*
 IsPlayerInGameFunction polls the Riot Spectator API every 5 minutes to check
-if a player is in an active game. On first detection it writes the match to
+if tracked players are in an active game. On first detection it writes the match to
 DynamoDB (for deduplication), publishes a notification to SNS, and
 schedules a one-time EventBridge event to collect post-game stats.
 */
@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,7 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/scheduler"
@@ -26,9 +28,56 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 )
 
-type Request struct {
-	PlayerName string `json:"playerName"`
-	TagLine    string `json:"tagLine"`
+// DynamoDBAPI is the interface for DynamoDB operations used by this function.
+type DynamoDBAPI interface {
+	GetItem(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
+	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+	Scan(ctx context.Context, params *dynamodb.ScanInput, optFns ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error)
+	UpdateItem(ctx context.Context, params *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
+}
+
+// SNSAPI is the interface for SNS operations used by this function.
+type SNSAPI interface {
+	Publish(ctx context.Context, params *sns.PublishInput, optFns ...func(*sns.Options)) (*sns.PublishOutput, error)
+}
+
+// SchedulerAPI is the interface for EventBridge Scheduler operations used by this function.
+type SchedulerAPI interface {
+	CreateSchedule(ctx context.Context, params *scheduler.CreateScheduleInput, optFns ...func(*scheduler.Options)) (*scheduler.CreateScheduleOutput, error)
+}
+
+// HTTPClient is the interface for making HTTP requests.
+type HTTPClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+// AppConfig holds configuration values loaded from environment variables.
+type AppConfig struct {
+	RiotAPIKey         string
+	RiotRegion         string
+	PlayersTableName   string
+	GameStatsTableName string
+	SNSTopicARN        string
+	GetGameStatsFnARN  string
+	SchedulerRoleARN   string
+	MatchRegion        string
+}
+
+// App holds the dependencies for the Lambda function.
+type App struct {
+	db        DynamoDBAPI
+	sns       SNSAPI
+	scheduler SchedulerAPI
+	http      HTTPClient
+	cfg       AppConfig
+}
+
+// Player represents a tracked player from the PlayersTable.
+type Player struct {
+	PlayerID string `dynamodbav:"playerId"`
+	GameName string `dynamodbav:"gameName"`
+	TagLine  string `dynamodbav:"tagLine"`
+	PUUID    string `dynamodbav:"puuid,omitempty"`
 }
 
 type NotificationMessage struct {
@@ -36,12 +85,6 @@ type NotificationMessage struct {
 	GameMode      string `json:"gameMode"`
 	ChampionID    int64  `json:"championId"`
 	GameStartTime int64  `json:"gameStartTime"`
-}
-
-type Response struct {
-	InGame     bool   `json:"inGame"`
-	GameMode   string `json:"gameMode,omitempty"`
-	ChampionID int64  `json:"championId,omitempty"`
 }
 
 type RiotAccountResponse struct {
@@ -61,98 +104,162 @@ type Participant struct {
 	ChampionID int64  `json:"championId"`
 }
 
+func loadConfig() (AppConfig, error) {
+	cfg := AppConfig{
+		RiotAPIKey:         os.Getenv("RIOT_API_KEY"),
+		RiotRegion:         os.Getenv("RIOT_REGION"),
+		PlayersTableName:   os.Getenv("PLAYERS_TABLE_NAME"),
+		GameStatsTableName: os.Getenv("DYNAMO_TABLE_NAME"),
+		SNSTopicARN:        os.Getenv("SNS_TOPIC_ARN"),
+		GetGameStatsFnARN:  os.Getenv("GET_GAME_STATS_FUNCTION_ARN"),
+		SchedulerRoleARN:   os.Getenv("SCHEDULER_ROLE_ARN"),
+		MatchRegion:        os.Getenv("MATCH_REGION"),
+	}
+	if cfg.RiotRegion == "" {
+		cfg.RiotRegion = "na1"
+	}
+	if cfg.RiotAPIKey == "" {
+		return cfg, fmt.Errorf("RIOT_API_KEY must be set")
+	}
+	if cfg.PlayersTableName == "" {
+		return cfg, fmt.Errorf("PLAYERS_TABLE_NAME must be set")
+	}
+	if cfg.GameStatsTableName == "" {
+		return cfg, fmt.Errorf("DYNAMO_TABLE_NAME must be set")
+	}
+	if cfg.SNSTopicARN == "" {
+		return cfg, fmt.Errorf("SNS_TOPIC_ARN must be set")
+	}
+	return cfg, nil
+}
+
 /*
-handler resolves the player's PUUID, checks for an active game, deduplicates
-via DynamoDB, sends a notification, and schedules post-game stats collection.
+handler scans the PlayersTable and processes each tracked player:
+resolve PUUID, check for active game, deduplicate, notify, and schedule stats.
+Errors per player are logged but don't abort the loop.
 */
-func handler(ctx context.Context, req Request) (Response, error) {
-	apiKey := os.Getenv("RIOT_API_KEY")
-	region := os.Getenv("RIOT_REGION")
-	if region == "" {
-		region = "na1"
-	}
-
-	if apiKey == "" {
-		return Response{}, fmt.Errorf("missing riot apiKey")
-	}
-
-	if req.PlayerName == "" {
-		req.PlayerName = os.Getenv("PLAYER_NAME")
-	}
-	if req.TagLine == "" {
-		req.TagLine = os.Getenv("TAG_LINE")
-	}
-
-	if req.PlayerName == "" || req.TagLine == "" {
-		return Response{}, fmt.Errorf("playerName and tagLine are required")
-	}
-
-	puuid, err := getPUUID(ctx, apiKey, req.PlayerName, req.TagLine)
+func (app *App) handler(ctx context.Context) error {
+	players, err := app.getPlayers(ctx)
 	if err != nil {
-		return Response{}, fmt.Errorf("failed to get PUUID: %w", err)
+		return fmt.Errorf("failed to get players: %w", err)
+	}
+	if len(players) == 0 {
+		log.Println("No players configured in PlayersTable")
+		return nil
 	}
 
-	spectator, err := getActiveGame(apiKey, region, puuid)
+	var errs []error
+	for _, player := range players {
+		if err := app.processPlayer(ctx, player); err != nil {
+			log.Printf("ERROR processing %s: %v", player.PlayerID, err)
+			errs = append(errs, fmt.Errorf("%s: %w", player.PlayerID, err))
+		}
+	}
+	if len(errs) == len(players) {
+		return fmt.Errorf("all players failed: %w", errors.Join(errs...))
+	}
+	return nil
+}
+
+// getPlayers scans the PlayersTable to retrieve all tracked players.
+func (app *App) getPlayers(ctx context.Context) ([]Player, error) {
+	result, err := app.db.Scan(ctx, &dynamodb.ScanInput{
+		TableName: &app.cfg.PlayersTableName,
+	})
 	if err != nil {
-		return Response{}, fmt.Errorf("failed to check active game: %w", err)
+		return nil, err
+	}
+
+	var players []Player
+	if err := attributevalue.UnmarshalListOfMaps(result.Items, &players); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal players: %w", err)
+	}
+	return players, nil
+}
+
+// processPlayer checks if a single player is in an active game and handles notification.
+func (app *App) processPlayer(ctx context.Context, player Player) error {
+	puuid := player.PUUID
+	if puuid == "" {
+		var err error
+		puuid, err = app.getPUUID(ctx, player.GameName, player.TagLine)
+		if err != nil {
+			return fmt.Errorf("failed to get PUUID: %w", err)
+		}
+		if err := app.cachePUUID(ctx, player.PlayerID, puuid); err != nil {
+			log.Printf("WARNING: failed to cache PUUID for %s: %v", player.PlayerID, err)
+		}
+	}
+
+	spectator, err := app.getActiveGame(ctx, puuid)
+	if err != nil {
+		return fmt.Errorf("failed to check active game: %w", err)
 	}
 	if spectator == nil {
-		return Response{InGame: false}, nil
+		return nil
 	}
 
 	matchID := fmt.Sprintf("%s_%d", spectator.PlatformID, spectator.GameID)
 
-	cfg, err := config.LoadDefaultConfig(ctx)
+	tracked, err := app.gameAlreadyTracked(ctx, matchID, puuid)
 	if err != nil {
-		return Response{}, fmt.Errorf("failed to load AWS config: %w", err)
-	}
-
-	tableName := os.Getenv("DYNAMO_TABLE_NAME")
-	dbClient := dynamodb.NewFromConfig(cfg)
-
-	tracked, err := gameAlreadyTracked(ctx, dbClient, tableName, matchID)
-	if err != nil {
-		return Response{}, fmt.Errorf("failed to check DynamoDB: %w", err)
+		return fmt.Errorf("failed to check DynamoDB: %w", err)
 	}
 	if tracked {
-		log.Printf("Game %s already tracked, skipping", matchID)
-		return Response{InGame: true, GameMode: spectator.GameMode}, nil
+		log.Printf("Game %s already tracked for %s, skipping", matchID, player.PlayerID)
+		return nil
 	}
 
-	if err := writeGameRecord(ctx, dbClient, tableName, matchID); err != nil {
-		return Response{}, fmt.Errorf("failed to write game record: %w", err)
+	if err := app.writeGameRecord(ctx, matchID, puuid); err != nil {
+		return fmt.Errorf("failed to write game record: %w", err)
 	}
 
 	var championID int64
-	for _, p := range spectator.Participants {
-		if p.PUUID == puuid {
-			championID = p.ChampionID
+	for _, participant := range spectator.Participants {
+		if participant.PUUID == puuid {
+			championID = participant.ChampionID
 			break
 		}
 	}
 
-	if err := publishNotification(ctx, cfg, req.PlayerName, spectator.GameMode, championID, spectator.GameStartTime); err != nil {
-		return Response{}, fmt.Errorf("failed to publish notification: %w", err)
+	if err := app.publishNotification(ctx, player.GameName, spectator.GameMode, championID, spectator.GameStartTime); err != nil {
+		return fmt.Errorf("failed to publish notification: %w", err)
 	}
 
-	schedulerClient := scheduler.NewFromConfig(cfg)
-	if err := createOneTimeSchedule(ctx, schedulerClient, matchID, puuid); err != nil {
+	puuidPrefix := puuid
+	if len(puuidPrefix) > 8 {
+		puuidPrefix = puuidPrefix[:8]
+	}
+	scheduleName := fmt.Sprintf("game-stats-%s-%s", matchID, puuidPrefix)
+	if err := app.createOneTimeSchedule(ctx, scheduleName, matchID, puuid); err != nil {
 		log.Printf("WARNING: failed to create stats schedule: %v", err)
 	}
 
-	return Response{
-		InGame:     true,
-		GameMode:   spectator.GameMode,
-		ChampionID: championID,
-	}, nil
+	return nil
 }
 
-// gameAlreadyTracked checks if a matchId already exists in DynamoDB to prevent duplicate notifications.
-func gameAlreadyTracked(ctx context.Context, client *dynamodb.Client, tableName, matchID string) (bool, error) {
-	result, err := client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: &tableName,
+// cachePUUID updates the player's record in PlayersTable with their resolved PUUID.
+func (app *App) cachePUUID(ctx context.Context, playerID, puuid string) error {
+	_, err := app.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &app.cfg.PlayersTableName,
+		Key: map[string]dbtypes.AttributeValue{
+			"playerId": &dbtypes.AttributeValueMemberS{Value: playerID},
+		},
+		UpdateExpression: aws.String("SET puuid = :p"),
+		ExpressionAttributeValues: map[string]dbtypes.AttributeValue{
+			":p": &dbtypes.AttributeValueMemberS{Value: puuid},
+		},
+	})
+	return err
+}
+
+// gameAlreadyTracked checks if a matchId+puuid composite key exists in DynamoDB.
+func (app *App) gameAlreadyTracked(ctx context.Context, matchID, puuid string) (bool, error) {
+	result, err := app.db.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &app.cfg.GameStatsTableName,
 		Key: map[string]dbtypes.AttributeValue{
 			"matchId": &dbtypes.AttributeValueMemberS{Value: matchID},
+			"puuid":   &dbtypes.AttributeValueMemberS{Value: puuid},
 		},
 		ProjectionExpression: aws.String("matchId"),
 	})
@@ -162,13 +269,13 @@ func gameAlreadyTracked(ctx context.Context, client *dynamodb.Client, tableName,
 	return result.Item != nil, nil
 }
 
-// writeGameRecord creates a minimal DynamoDB record with just the matchId key.
-// Stats fields are populated later by GetGameStatsFunction.
-func writeGameRecord(ctx context.Context, client *dynamodb.Client, tableName, matchID string) error {
-	_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: &tableName,
+// writeGameRecord creates a minimal DynamoDB record with the matchId+puuid composite key.
+func (app *App) writeGameRecord(ctx context.Context, matchID, puuid string) error {
+	_, err := app.db.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &app.cfg.GameStatsTableName,
 		Item: map[string]dbtypes.AttributeValue{
 			"matchId": &dbtypes.AttributeValueMemberS{Value: matchID},
+			"puuid":   &dbtypes.AttributeValueMemberS{Value: puuid},
 		},
 	})
 	return err
@@ -178,32 +285,25 @@ func writeGameRecord(ctx context.Context, client *dynamodb.Client, tableName, ma
 createOneTimeSchedule creates an EventBridge Scheduler one-time schedule that
 invokes GetGameStatsFunction in 1 hour. The schedule auto-deletes after execution.
 */
-func createOneTimeSchedule(ctx context.Context, client *scheduler.Client, matchID, puuid string) error {
-	functionArn := os.Getenv("GET_GAME_STATS_FUNCTION_ARN")
-	roleArn := os.Getenv("SCHEDULER_ROLE_ARN")
-	matchRegion := os.Getenv("MATCH_REGION")
-
-	if functionArn == "" || roleArn == "" || matchRegion == "" {
+func (app *App) createOneTimeSchedule(ctx context.Context, scheduleName, matchID, puuid string) error {
+	if app.cfg.GetGameStatsFnARN == "" || app.cfg.SchedulerRoleARN == "" || app.cfg.MatchRegion == "" {
 		return fmt.Errorf("GET_GAME_STATS_FUNCTION_ARN, SCHEDULER_ROLE_ARN, and MATCH_REGION must be set")
 	}
 
-	scheduleName := fmt.Sprintf("game-stats-%s", matchID)
 	scheduleTime := time.Now().Add(1 * time.Hour).UTC().Format("2006-01-02T15:04:05")
 	scheduleExpr := fmt.Sprintf("at(%s)", scheduleTime)
-
 	payload := fmt.Sprintf(`{"matchId":"%s","puuid":"%s"}`, matchID, puuid)
-
 	deleteAction := schedulertypes.ActionAfterCompletionDelete
 
-	_, err := client.CreateSchedule(ctx, &scheduler.CreateScheduleInput{
+	_, err := app.scheduler.CreateSchedule(ctx, &scheduler.CreateScheduleInput{
 		Name:                       &scheduleName,
 		ScheduleExpression:         &scheduleExpr,
 		ScheduleExpressionTimezone: aws.String("UTC"),
 		ActionAfterCompletion:      deleteAction,
 		FlexibleTimeWindow:         &schedulertypes.FlexibleTimeWindow{Mode: schedulertypes.FlexibleTimeWindowModeOff},
 		Target: &schedulertypes.Target{
-			Arn:     &functionArn,
-			RoleArn: &roleArn,
+			Arn:     &app.cfg.GetGameStatsFnARN,
+			RoleArn: &app.cfg.SchedulerRoleARN,
 			Input:   &payload,
 		},
 	})
@@ -216,15 +316,15 @@ func createOneTimeSchedule(ctx context.Context, client *scheduler.Client, matchI
 }
 
 // getPUUID resolves a Riot ID (name#tag) to a PUUID via the Riot Account API.
-func getPUUID(ctx context.Context, apiKey, name, tag string) (string, error) {
+func (app *App) getPUUID(ctx context.Context, name, tag string) (string, error) {
 	url := fmt.Sprintf("https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/%s/%s", name, tag)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
-	httpReq.Header.Set("X-Riot-Token", apiKey)
+	httpReq.Header.Set("X-Riot-Token", app.cfg.RiotAPIKey)
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := app.http.Do(httpReq)
 	if err != nil {
 		return "", err
 	}
@@ -245,15 +345,15 @@ func getPUUID(ctx context.Context, apiKey, name, tag string) (string, error) {
 }
 
 // getActiveGame calls the Spectator V5 API. Returns nil if the player is not in a game.
-func getActiveGame(apiKey, region, puuid string) (*SpectatorResponse, error) {
-	url := fmt.Sprintf("https://%s.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/%s", region, puuid)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func (app *App) getActiveGame(ctx context.Context, puuid string) (*SpectatorResponse, error) {
+	url := fmt.Sprintf("https://%s.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/%s", app.cfg.RiotRegion, puuid)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-Riot-Token", apiKey)
+	req.Header.Set("X-Riot-Token", app.cfg.RiotAPIKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := app.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -275,12 +375,7 @@ func getActiveGame(apiKey, region, puuid string) (*SpectatorResponse, error) {
 }
 
 // publishNotification publishes a game detection message to SNS for fan-out to notification channels.
-func publishNotification(ctx context.Context, cfg aws.Config, playerName, gameMode string, championID, gameStartTime int64) error {
-	topicArn := os.Getenv("SNS_TOPIC_ARN")
-	if topicArn == "" {
-		return fmt.Errorf("SNS_TOPIC_ARN not set")
-	}
-
+func (app *App) publishNotification(ctx context.Context, playerName, gameMode string, championID, gameStartTime int64) error {
 	msg := NotificationMessage{
 		PlayerName:    playerName,
 		GameMode:      gameMode,
@@ -293,15 +388,32 @@ func publishNotification(ctx context.Context, cfg aws.Config, playerName, gameMo
 		return fmt.Errorf("failed to marshal notification: %w", err)
 	}
 
-	client := sns.NewFromConfig(cfg)
 	message := string(payload)
-	_, err = client.Publish(ctx, &sns.PublishInput{
-		TopicArn: &topicArn,
+	_, err = app.sns.Publish(ctx, &sns.PublishInput{
+		TopicArn: &app.cfg.SNSTopicARN,
 		Message:  &message,
 	})
 	return err
 }
 
 func main() {
-	lambda.Start(handler)
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	awsCfg, err := config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to load AWS config: %v", err)
+	}
+
+	app := &App{
+		db:        dynamodb.NewFromConfig(awsCfg),
+		sns:       sns.NewFromConfig(awsCfg),
+		scheduler: scheduler.NewFromConfig(awsCfg),
+		http:      http.DefaultClient,
+		cfg:       cfg,
+	}
+
+	lambda.Start(app.handler)
 }

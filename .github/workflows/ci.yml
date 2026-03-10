@@ -1,0 +1,70 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        function:
+          - functions/is-player-in-game
+          - functions/get-game-stats
+          - functions/notify-webhooks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: ${{ matrix.function }}
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        function:
+          - functions/is-player-in-game
+          - functions/get-game-stats
+          - functions/notify-webhooks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Run tests
+        working-directory: ${{ matrix.function }}
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/setup-sam@v2
+      - run: sam build
+      - run: >
+          sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+          --parameter-overrides
+          RiotApiKey=${{ secrets.RIOT_API_KEY }}
+          SesSenderEmail=${{ secrets.SES_SENDER_EMAIL }}
+          RecipientEmail=${{ secrets.RECIPIENT_EMAIL }}
+          DiscordWebhookUrl=${{ secrets.DISCORD_WEBHOOK_URL }}

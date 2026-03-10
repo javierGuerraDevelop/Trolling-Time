@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Riot Notifier - Check if a League of Legends player is in game and notify via webhooks
+Description: Riot Notifier - Monitor League of Legends players and notify via webhooks
 
 Parameters:
   RiotApiKey:
@@ -14,12 +14,6 @@ Parameters:
     Type: String
     Default: na1
     Description: Riot Games API region (e.g. na1, euw1, kr)
-  PlayerName:
-    Type: String
-    Description: Riot Games player name to monitor
-  TagLine:
-    Type: String
-    Description: Riot Games tag line to monitor (without the #)
   RecipientEmail:
     Type: String
     Description: Email address to notify when player is in game
@@ -50,6 +44,18 @@ Resources:
     Properties:
       TopicName: !Sub "${AWS::StackName}-notifications"
 
+  PlayersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-players"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: playerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: playerId
+          KeyType: HASH
+
   GameStatsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -58,9 +64,13 @@ Resources:
       AttributeDefinitions:
         - AttributeName: matchId
           AttributeType: S
+        - AttributeName: puuid
+          AttributeType: S
       KeySchema:
         - AttributeName: matchId
           KeyType: HASH
+        - AttributeName: puuid
+          KeyType: RANGE
 
   SchedulerRole:
     Type: AWS::IAM::Role
@@ -86,11 +96,11 @@ Resources:
     Properties:
       CodeUri: functions/is-player-in-game/
       Handler: bootstrap
+      Timeout: 30
       Environment:
         Variables:
           RIOT_REGION: !Ref RiotRegion
-          PLAYER_NAME: !Ref PlayerName
-          TAG_LINE: !Ref TagLine
+          PLAYERS_TABLE_NAME: !Ref PlayersTable
           DYNAMO_TABLE_NAME: !Ref GameStatsTable
           GET_GAME_STATS_FUNCTION_ARN: !GetAtt GetGameStatsFunction.Arn
           SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
@@ -101,7 +111,7 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: rate(5 minutes)
-            Description: Check if player is in a League game every 5 minutes
+            Description: Check if tracked players are in a League game every 5 minutes
             Enabled: true
       Policies:
         - Statement:
@@ -110,6 +120,8 @@ Resources:
               Resource: !Ref NotificationTopic
         - DynamoDBCrudPolicy:
             TableName: !Ref GameStatsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PlayersTable
         - Statement:
             - Effect: Allow
               Action: scheduler:CreateSchedule
